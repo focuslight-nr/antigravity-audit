@@ -1,0 +1,13 @@
+# Generated audit outputs
+*.html
+*.json
+baseline*.json
+audit*.json
+summary*.txt
+
+# macOS
+.DS_Store
+
+# Local scratch
+tmp/
+.tmp/
