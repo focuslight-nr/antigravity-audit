@@ -112,7 +112,9 @@ mask_email() {
         local domain="${email#*@}"
         local masked=""
         if ((${#name} > 2)); then
-            masked="${name[1,2]}$(printf '*%.0s' {3..${#name}})"
+            # ${name:0:2} keeps the first two characters whichever way KSH_ARRAYS
+            # has arrays indexed; ${name[1,2]} would return the 2nd and 3rd here.
+            masked="${name:0:2}$(printf '*%.0s' {3..${#name}})"
         else
             masked="${name}**"
         fi
@@ -309,7 +311,7 @@ parse_skill_frontmatter() {
 }
 
 collect_customizations() {
-    local config_dir="$1" source="$2" file parsed name desc path scripts_dir script_count
+    local config_dir="$1" source="$2" file parsed name desc skill_path scripts_dir script_count
     local skills_dir="$config_dir/skills"
     if [[ -d "$skills_dir" ]]; then
         for file in "$skills_dir"/**/SKILL.md; do
@@ -318,8 +320,8 @@ collect_customizations() {
             name="${parsed%%|*}"
             local rest="${parsed#*|}"
             desc="${rest%%|*}"
-            path="${rest#*|}"
-            SKILLS+=("$source|$name|$desc|$path")
+            skill_path="${rest#*|}"
+            SKILLS+=("$source|$name|$desc|$skill_path")
             
             # Check for helper scripts
             scripts_dir="$(dirname "$file")/scripts"
@@ -361,20 +363,20 @@ collect_projects() {
     if [[ -f "$projects" ]]; then
         add_sensitive_file "projects.json" "$projects" "REVIEW"
         if [[ "$HAS_JQ" == "true" ]]; then
-            local keys path name has_agents
+            local keys proj_path name has_agents
             keys=$(jq -r '.projects | keys[]' "$projects" 2>/dev/null) || return
-            while read -r path; do
-                [[ -z "$path" ]] && continue
-                name=$(jq -r --arg p "$path" '.projects[$p]' "$projects" 2>/dev/null)
+            while read -r proj_path; do
+                [[ -z "$proj_path" ]] && continue
+                name=$(jq -r --arg p "$proj_path" '.projects[$p]' "$projects" 2>/dev/null)
                 has_agents="false"
-                if [[ -d "$path" ]]; then
-                    local agents_dir="$path/.agents"
+                if [[ -d "$proj_path" ]]; then
+                    local agents_dir="$proj_path/.agents"
                     if [[ -d "$agents_dir" ]]; then
                         has_agents="true"
                         collect_customizations "$agents_dir" "workspace:$name"
                     fi
                 fi
-                PROJECTS+=("$path|$name|$has_agents")
+                PROJECTS+=("$proj_path|$name|$has_agents")
             done <<< "$keys"
             ((${#PROJECTS[@]} > 0)) && add_finding "INFO" "Projects" "${#PROJECTS[@]} project(s) registered"
         fi
@@ -386,16 +388,16 @@ collect_trusted_folders() {
     if [[ -f "$trusted" ]]; then
         add_sensitive_file "trustedFolders.json" "$trusted" "REVIEW"
         if [[ "$HAS_JQ" == "true" ]]; then
-            local keys path level summary
+            local keys folder level summary
             keys=$(jq -r 'keys[]' "$trusted" 2>/dev/null) || return
-            while read -r path; do
-                [[ -z "$path" ]] && continue
-                level=$(jq -r --arg p "$path" '.[$p]' "$trusted" 2>/dev/null)
-                summary=$(get_file_broad_summary "$path")
+            while read -r folder; do
+                [[ -z "$folder" ]] && continue
+                level=$(jq -r --arg p "$folder" '.[$p]' "$trusted" 2>/dev/null)
+                summary=$(get_file_broad_summary "$folder")
                 # Remove broad= suffix
                 summary="${summary% broad=*}"
-                TRUSTED_FOLDERS+=("$path|$level|$summary")
-                add_finding "WARN" "Trusted Folders" "Trusted folder grants Antigravity broader workspace autonomy" "path=$path; trust=$level"
+                TRUSTED_FOLDERS+=("$folder|$level|$summary")
+                add_finding "WARN" "Trusted Folders" "Trusted folder grants Antigravity broader workspace autonomy" "path=$folder; trust=$level"
             done <<< "$keys"
             ((${#TRUSTED_FOLDERS[@]} > 0)) && add_finding "INFO" "Trusted Folders" "${#TRUSTED_FOLDERS[@]} trusted folder(s) configured"
         fi
@@ -445,16 +447,22 @@ collect_runtime() {
     fi
 }
 
+# Pick the nth (1-based) |-delimited field out of a packed inventory row.
+# Indexing an array here would depend on KSH_ARRAYS, which this script sets, so
+# strip prefixes instead: that behaves the same whichever way arrays are indexed.
 json_split_field() {
     local s="$1" field="$2"
-    local IFS="|"
-    local parts=(${(s:|:)s})
-    printf '%s' "${parts[$field]}"
+    local rest="$s"
+    local i
+    for ((i=1; i<field; i++)); do
+        rest="${rest#*|}"
+    done
+    printf '%s' "${rest%%|*}"
 }
 
 render_json() {
     local findings="[" idx=0 i
-    for ((i=1; i<=${#FINDING_SEV[@]}; i++)); do
+    for ((i=0; i<${#FINDING_SEV[@]}; i++)); do
         ((idx > 0)) && findings+=","
         findings+="{\"severity\":$(jstr "${FINDING_SEV[$i]}"),\"section\":$(jstr "${FINDING_SECT[$i]}"),\"message\":$(jstr_out "${FINDING_MSG[$i]}"),\"detail\":$(jstr_out "${FINDING_DET[$i]}")}"
         ((idx++))
@@ -509,7 +517,7 @@ render_json() {
 
 html_rows_findings() {
     local i
-    for ((i=1; i<=${#FINDING_SEV[@]}; i++)); do
+    for ((i=0; i<${#FINDING_SEV[@]}; i++)); do
         [[ "$OPT_QUIET" == "true" && "${FINDING_SEV[$i]}" == "INFO" ]] && continue
         printf '<tr><td><span class="badge %s">%s</span></td><td>%s</td><td>%s</td><td><code>%s</code></td></tr>\n' \
             "$(html_escape "${(L)FINDING_SEV[$i]}")" "$(html_escape "${FINDING_SEV[$i]}")" "$(html_escape "${FINDING_SECT[$i]}")" "$(html_out "${FINDING_MSG[$i]}")" "$(html_out "${FINDING_DET[$i]}")"
@@ -579,7 +587,7 @@ write_terminal_report() {
     if [[ "$OPT_SUMMARY" == "true" ]]; then
         printf '%s  WARN=%d REVIEW=%d INFO=%d  %s\n' "$(display_text "$AUDIT_USER")" "$WARN_COUNT" "$REVIEW_COUNT" "$INFO_COUNT" "$(display_text "$ANTIGRAVITY_DIR")"
         shown=0
-        for ((i=1; i<=${#FINDING_SEV[@]}; i++)); do
+        for ((i=0; i<${#FINDING_SEV[@]}; i++)); do
             [[ "${FINDING_SEV[$i]}" == "INFO" ]] && continue
             printf '  [%s] %s: %s\n' "${FINDING_SEV[$i]}" "${FINDING_SECT[$i]}" "$(display_text "${FINDING_MSG[$i]}")"
             ((shown++))
@@ -595,7 +603,7 @@ write_terminal_report() {
 
     if [[ "$OPT_QUIET" != "true" || "$WARN_COUNT" -gt 0 || "$REVIEW_COUNT" -gt 0 ]]; then
         print -r -- 'Findings'
-        for ((i=1; i<=${#FINDING_SEV[@]}; i++)); do
+        for ((i=0; i<${#FINDING_SEV[@]}; i++)); do
             [[ "$OPT_QUIET" == "true" && "${FINDING_SEV[$i]}" == "INFO" ]] && continue
             printf '  [%s] %-16s %s\n' "${FINDING_SEV[$i]}" "${FINDING_SECT[$i]}" "$(display_text "${FINDING_MSG[$i]}")"
             [[ -n "${FINDING_DET[$i]}" ]] && printf '       %s\n' "$(display_text "${FINDING_DET[$i]}")"
@@ -737,12 +745,12 @@ fi
 
 # Output logic
 if [[ -n "$OPT_HTML" ]]; then
-    local path="$OPT_HTML"
-    if [[ "$path" == "AUTO" ]]; then
-        path="antigravity_audit_$(date '+%Y%m%d_%H%M%S').html"
+    out_file="$OPT_HTML"
+    if [[ "$out_file" == "AUTO" ]]; then
+        out_file="antigravity_audit_$(date '+%Y%m%d_%H%M%S').html"
     fi
-    printf '%s' "$content" > "$path"
-    printf 'HTML report written: %s\n' "$path"
+    printf '%s' "$content" > "$out_file"
+    printf 'HTML report written: %s\n' "$out_file"
 elif [[ -n "$OPT_OUTPUT" ]]; then
     printf '%s' "$content" > "$OPT_OUTPUT"
 else
