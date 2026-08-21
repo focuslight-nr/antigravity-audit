@@ -1,5 +1,5 @@
 # ANTIGRAVITY-AUDIT - Antigravity local security audit tool (Windows/PowerShell)
-# Read-only audit for ~/.gemini configuration, projects, trusted folders, and sensitive files.
+# Read-only audit for ~/.gemini configuration, MCP servers, hooks, plugins, projects, trusted folders, security policies, and sensitive files.
 [CmdletBinding()]
 param(
     [Parameter(ValueFromRemainingArguments = $true)]
@@ -7,11 +7,15 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:Version = '0.1.0'
+$script:Version = '0.2.0'
 $script:AntigravityDirName = '.gemini'
+$script:DangerousMcpHints = @('bash', 'sh', 'zsh', 'python', 'python3', 'node', 'ruby', 'perl', 'osascript', 'sqlite3', 'psql', 'mysql', 'curl', 'wget', 'nc', 'ncat', 'ssh', 'scp')
+$script:SensitiveNamePattern = '(?i)(token|secret|password|passwd|api[_-]?key|credential|auth|session|cookie)'
 
 $script:Options = @{
     Json = $false
+    Diff = $null
+    DiffJson = $false
     Html = $null
     Summary = $false
     Output = $null
@@ -27,7 +31,8 @@ function Show-Usage {
     @"
 ANTIGRAVITY-AUDIT v$($script:Version) - Antigravity local security audit
 Usage: .\antigravity_audit.ps1 [--html [FILE]] [--json] [--summary] [--output FILE]
-       [--fail-on warn|review] [--redact-paths] [--user USER] [--all-users]
+       [--diff BASELINE.json] [--diff-json] [--fail-on warn|review]
+       [--redact-paths] [--user USER] [--all-users]
        [--antigravity-dir DIR] [-q|--quiet] [--version] [-h|--help]
 "@
 }
@@ -43,6 +48,7 @@ for ($i = 0; $i -lt $CliArgs.Count; $i++) {
     $arg = $CliArgs[$i]
     switch ($arg) {
         '--json' { $script:Options.Json = $true }
+        '--diff-json' { $script:Options.DiffJson = $true }
         '--summary' { $script:Options.Summary = $true }
         '--redact-paths' { $script:Options.RedactPaths = $true }
         '--all-users' { $script:Options.AllUsers = $true }
@@ -59,12 +65,13 @@ for ($i = 0; $i -lt $CliArgs.Count; $i++) {
                 $script:Options.Html = 'AUTO'
             }
         }
-        { $_ -in @('--output', '--fail-on', '--user', '--antigravity-dir') } {
+        { $_ -in @('--output', '--fail-on', '--user', '--antigravity-dir', '--diff') } {
             if (($i + 1) -ge $CliArgs.Count) { Exit-ArgumentError "Missing value for $arg" }
             $i++
             $value = $CliArgs[$i]
             switch ($arg) {
                 '--output' { $script:Options.Output = $value }
+                '--diff' { $script:Options.Diff = $value }
                 '--fail-on' { $script:Options.FailOn = $value.ToLowerInvariant() }
                 '--user' { $script:Options.User = $value }
                 '--antigravity-dir' { $script:Options.AntigravityDir = $value }
@@ -74,6 +81,15 @@ for ($i = 0; $i -lt $CliArgs.Count; $i++) {
     }
 }
 
+if ($script:Options.Diff -and $script:Options.Html) {
+    Exit-ArgumentError '--diff and --html are mutually exclusive'
+}
+if ($script:Options.Diff -and $script:Options.Json -and -not $script:Options.DiffJson) {
+    Exit-ArgumentError '--diff and --json are mutually exclusive; use --diff-json for JSON diff output'
+}
+if ($script:Options.DiffJson -and -not $script:Options.Diff) {
+    Exit-ArgumentError '--diff-json requires --diff BASELINE.json'
+}
 if ($script:Options.Json -and $script:Options.Html) {
     Exit-ArgumentError '--json and --html are mutually exclusive'
 }
@@ -102,6 +118,10 @@ function New-AuditState([string]$UserName, [string]$HomeDir, [string]$Antigravit
         Timestamp = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
         Hostname = [Environment]::MachineName
         Findings = [Collections.Generic.List[object]]::new()
+        McpServers = [Collections.Generic.List[object]]::new()
+        Hooks = [Collections.Generic.List[object]]::new()
+        Plugins = [Collections.Generic.List[object]]::new()
+        SecuritySettings = [Collections.Generic.List[object]]::new()
         TrustedFolders = [Collections.Generic.List[object]]::new()
         Projects = [Collections.Generic.List[object]]::new()
         Skills = [Collections.Generic.List[object]]::new()
@@ -247,6 +267,381 @@ function Parse-SkillFrontmatter([string]$Path) {
     }
 }
 
+function Collect-McpFile($State, [string]$Path, [string]$Source) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return }
+    Add-SensitiveFile $State (Split-Path $Path -Leaf) $Path 'REVIEW'
+    $json = Read-JsonFile $Path
+    if ($null -eq $json) {
+        Add-Finding $State 'INFO' 'MCP Servers' "MCP config found at $Path (unable to parse JSON)" "source=$Source"
+        return
+    }
+    $serversObj = Get-Property $json 'mcpServers'
+    foreach ($server in (Get-ObjectEntries $serversObj)) {
+        $name = $server.Name
+        $cfg = $server.Value
+        $cmd = [string](Get-Property $cfg 'command')
+        $args = (Get-Property $cfg 'args')
+        $argsStr = if ($args) { ($args | ForEach-Object { [string]$_ }) -join ' ' } else { '' }
+        $url = [string](Get-Property $cfg 'serverUrl')
+        $envObj = Get-Property $cfg 'env'
+        $envKeys = if ($envObj) { (Get-ObjectEntries $envObj | ForEach-Object { $_.Name }) -join ',' } else { '' }
+
+        if ($url) {
+            $State.McpServers.Add([pscustomobject]@{
+                name = $name
+                type = 'sse'
+                command_or_url = $url
+                args = ''
+                env_keys = ''
+                source = $Source
+            })
+            if ($url -like 'http://*') {
+                Add-Finding $State 'WARN' 'MCP Servers' "Unencrypted SSE MCP server: $name" "url=$url; source=$Source"
+            } else {
+                Add-Finding $State 'REVIEW' 'MCP Servers' "Remote SSE MCP server configured: $name" "url=$url; source=$Source"
+            }
+        } else {
+            $State.McpServers.Add([pscustomobject]@{
+                name = $name
+                type = 'stdio'
+                command_or_url = $cmd
+                args = $argsStr
+                env_keys = $envKeys
+                source = $Source
+            })
+            $cmdLeaf = Split-Path $cmd -Leaf
+            $isDangerous = $false
+            foreach ($hint in $script:DangerousMcpHints) {
+                if ($cmdLeaf -eq $hint -or $cmd -like "*\$hint" -or $cmd -like "*/$hint") {
+                    $isDangerous = $true
+                    break
+                }
+            }
+            if ($isDangerous) {
+                Add-Finding $State 'WARN' 'MCP Servers' "MCP server executes broad command runner: $name" "cmd=$cmd $argsStr; source=$Source"
+            } else {
+                Add-Finding $State 'REVIEW' 'MCP Servers' "Local MCP server configured: $name" "cmd=$cmd $argsStr; source=$Source"
+            }
+            if ($envKeys -match $script:SensitiveNamePattern) {
+                Add-Finding $State 'REVIEW' 'MCP Servers' "MCP server has sensitive environment variables: $name" "keys=$envKeys; source=$Source"
+            }
+        }
+    }
+}
+
+function Collect-HooksFile($State, [string]$Path, [string]$Source) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return }
+    Add-SensitiveFile $State (Split-Path $Path -Leaf) $Path 'REVIEW'
+    $json = Read-JsonFile $Path
+    if ($null -eq $json) {
+        Add-Finding $State 'INFO' 'Hooks' "Hooks config found at $Path (unable to parse JSON)" "source=$Source"
+        return
+    }
+
+    foreach ($hookEntry in (Get-ObjectEntries $json)) {
+        $hname = $hookEntry.Name
+        $hcfg = $hookEntry.Value
+        $enabledVal = Get-Property $hcfg 'enabled'
+        $enabled = if ($null -ne $enabledVal) { $enabledVal.ToString().ToLowerInvariant() } else { 'true' }
+
+        # Grouped events (PreToolUse, PostToolUse)
+        foreach ($ev in @('PreToolUse', 'PostToolUse')) {
+            $evList = Get-Property $hcfg $ev
+            if ($evList) {
+                foreach ($grp in @($evList)) {
+                    $matcher = [string](Get-Property $grp 'matcher')
+                    if (-not $matcher) { $matcher = '*' }
+                    $innerHooks = Get-Property $grp 'hooks'
+                    if ($innerHooks) {
+                        foreach ($h in @($innerHooks)) {
+                            $htype = [string](Get-Property $h 'type')
+                            if (-not $htype) { $htype = 'command' }
+                            $hcmd = [string](Get-Property $h 'command')
+                            $htimeout = [string](Get-Property $h 'timeout')
+                            if (-not $htimeout) { $htimeout = '30' }
+
+                            $State.Hooks.Add([pscustomobject]@{
+                                name = $hname
+                                event = $ev
+                                matcher = $matcher
+                                type = $htype
+                                command = $hcmd
+                                enabled = $enabled
+                                source = $Source
+                                timeout = $htimeout
+                            })
+                            if ($enabled -eq 'true') {
+                                if ($hcmd -match '(?i)(curl|wget|nc|fetch|rm\s+-rf|sudo|eval|exec)') {
+                                    Add-Finding $State 'WARN' 'Hooks' "High-risk lifecycle hook command ($ev): $hname" "cmd=$hcmd; source=$Source"
+                                } else {
+                                    Add-Finding $State 'REVIEW' 'Hooks' "Lifecycle hook command configured ($ev): $hname" "cmd=$hcmd; matcher=$matcher; source=$Source"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        # Flat events (PreInvocation, PostInvocation, Stop)
+        foreach ($ev in @('PreInvocation', 'PostInvocation', 'Stop')) {
+            $evList = Get-Property $hcfg $ev
+            if ($evList) {
+                foreach ($h in @($evList)) {
+                    $htype = [string](Get-Property $h 'type')
+                    if (-not $htype) { $htype = 'command' }
+                    $hcmd = [string](Get-Property $h 'command')
+                    $htimeout = [string](Get-Property $h 'timeout')
+                    if (-not $htimeout) { $htimeout = '30' }
+
+                    $State.Hooks.Add([pscustomobject]@{
+                        name = $hname
+                        event = $ev
+                        matcher = 'N/A'
+                        type = $htype
+                        command = $hcmd
+                        enabled = $enabled
+                        source = $Source
+                        timeout = $htimeout
+                    })
+                    if ($enabled -eq 'true') {
+                        if ($hcmd -match '(?i)(curl|wget|nc|fetch|rm\s+-rf|sudo|eval|exec)') {
+                            Add-Finding $State 'WARN' 'Hooks' "High-risk lifecycle hook command ($ev): $hname" "cmd=$hcmd; source=$Source"
+                        } else {
+                            Add-Finding $State 'REVIEW' 'Hooks' "Lifecycle hook command configured ($ev): $hname" "cmd=$hcmd; source=$Source"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+function Collect-Plugins($State, [string]$PluginsDir, [string]$Source, [string]$ConfigJsonPath = '') {
+    if (-not (Test-Path -LiteralPath $PluginsDir -PathType Container)) { return }
+    $pdirs = @(Get-ChildItem -LiteralPath $PluginsDir -Directory -ErrorAction SilentlyContinue)
+    $configJson = if ($ConfigJsonPath -and (Test-Path -LiteralPath $ConfigJsonPath -PathType Leaf)) { Read-JsonFile $ConfigJsonPath } else { $null }
+
+    foreach ($pdir in $pdirs) {
+        $id = $pdir.Name
+        $manifestPath = Join-Path $pdir.FullName 'plugin.json'
+        $pname = $id
+        $pdisabled = 'false'
+        $enabled = 'true'
+        $features = [Collections.Generic.List[string]]::new()
+
+        if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
+            $manifest = Read-JsonFile $manifestPath
+            if ($manifest) {
+                $nameVal = Get-Property $manifest 'name'
+                if ($nameVal) { $pname = [string]$nameVal }
+                $disVal = Get-Property $manifest 'disabled'
+                if ($null -ne $disVal) { $pdisabled = $disVal.ToString().ToLowerInvariant() }
+            }
+        }
+
+        if ($configJson) {
+            $pluginsMap = Get-Property $configJson 'plugins'
+            if ($pluginsMap) {
+                $pOverride = Get-Property (Get-Property $pluginsMap $id) 'enabled'
+                if ($null -ne $pOverride) {
+                    $enabled = $pOverride.ToString().ToLowerInvariant()
+                } elseif ($pdisabled -eq 'true') {
+                    $enabled = 'false'
+                }
+            } elseif ($pdisabled -eq 'true') {
+                $enabled = 'false'
+            }
+        } elseif ($pdisabled -eq 'true') {
+            $enabled = 'false'
+        }
+
+        if (Test-Path -LiteralPath (Join-Path $pdir.FullName 'skills') -PathType Container) { $features.Add('skills') }
+        if (Test-Path -LiteralPath (Join-Path $pdir.FullName 'rules') -PathType Container -or Test-Path -LiteralPath (Join-Path (Join-Path $pdir.FullName 'rules') 'AGENTS.md') -PathType Leaf) { $features.Add('rules') }
+        if (Test-Path -LiteralPath (Join-Path $pdir.FullName 'hooks.json') -PathType Leaf) { $features.Add('hooks') }
+        if (Test-Path -LiteralPath (Join-Path $pdir.FullName 'mcp_config.json') -PathType Leaf) { $features.Add('mcp') }
+
+        $featsStr = $features -join ','
+        $State.Plugins.Add([pscustomobject]@{
+            id = $id
+            name = $pname
+            enabled = $enabled
+            source = $Source
+            path = $pdir.FullName
+            features = $featsStr
+        })
+
+        if ($enabled -eq 'true') {
+            Add-Finding $State 'INFO' 'Plugins' "Plugin '$pname' enabled" "features=$featsStr; source=$Source"
+            Collect-McpFile $State (Join-Path $pdir.FullName 'mcp_config.json') "plugin:$id"
+            Collect-HooksFile $State (Join-Path $pdir.FullName 'hooks.json') "plugin:$id"
+            Collect-Customizations $State $pdir.FullName "plugin:$id"
+        } else {
+            Add-Finding $State 'INFO' 'Plugins' "Plugin '$pname' disabled" "source=$Source"
+        }
+    }
+}
+
+function Collect-JsonConfigs($State, [string]$BaseDir, [string]$Source) {
+    foreach ($cname in @('skills.json', 'plugins.json')) {
+        $cfile = Join-Path $BaseDir $cname
+        if (Test-Path -LiteralPath $cfile -PathType Leaf) {
+            Add-SensitiveFile $State $cname $cfile 'REVIEW'
+            $json = Read-JsonFile $cfile
+            if ($json) {
+                $inherits = @(Get-Property $json 'inherits')
+                $entries = @(Get-Property $json 'entries')
+                if ($inherits.Count -gt 0 -or $entries.Count -gt 0) {
+                    Add-Finding $State 'INFO' 'Customizations' "$cname registered" "inherits=$($inherits.Count); entries=$($entries.Count); source=$Source"
+                }
+            }
+        }
+    }
+}
+
+function Collect-SecuritySettings($State, [string]$Path, [string]$Scope) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return }
+    Add-SensitiveFile $State "$([IO.Path]::GetFileName($Path)) ($Scope)" $Path 'REVIEW'
+    $json = Read-JsonFile $Path
+    if ($null -eq $json) { return }
+
+    # 1. Tool execution policy
+    $toolPolicy = Get-Property $json 'toolExecutionPolicy'
+    if (-not $toolPolicy) { $toolPolicy = Get-Property (Get-Property $json 'general') 'toolExecutionPolicy' }
+    if (-not $toolPolicy) { $toolPolicy = Get-Property $json 'autoExecutionPolicy' }
+    if ($toolPolicy) {
+        $pStr = [string]$toolPolicy
+        $rlevel = if ($pStr -eq 'always-proceed') { 'WARN' } else { 'INFO' }
+        $State.SecuritySettings.Add([pscustomobject]@{
+            scope = $Scope
+            key = 'toolExecutionPolicy'
+            value = $pStr
+            risk_level = $rlevel
+        })
+        if ($pStr -eq 'always-proceed') {
+            Add-Finding $State 'WARN' 'Security Settings' 'Unrestricted tool execution policy enabled (always-proceed)' "scope=$Scope; setting=toolExecutionPolicy"
+        } else {
+            Add-Finding $State 'INFO' 'Security Settings' "Tool execution policy: $pStr" "scope=$Scope"
+        }
+    }
+
+    # 2. Terminal Sandbox mode
+    $sandboxObj = Get-Property $json 'sandbox'
+    $sandboxEnabled = if ($sandboxObj) { Get-Property $sandboxObj 'enabled' } else { Get-Property $json 'terminalSandbox' }
+    if ($null -ne $sandboxEnabled) {
+        $sStr = $sandboxEnabled.ToString().ToLowerInvariant()
+        $rlevel = if ($sStr -eq 'false') { 'WARN' } else { 'INFO' }
+        $State.SecuritySettings.Add([pscustomobject]@{
+            scope = $Scope
+            key = 'sandbox.enabled'
+            value = $sStr
+            risk_level = $rlevel
+        })
+        if ($sStr -eq 'false') {
+            Add-Finding $State 'WARN' 'Security Settings' 'Terminal command sandboxing is disabled' "scope=$Scope"
+        }
+    }
+    $sandboxNet = if ($sandboxObj) { Get-Property $sandboxObj 'network' } else { Get-Property $json 'networkIsolation' }
+    if ($null -ne $sandboxNet) {
+        $nStr = $sandboxNet.ToString().ToLowerInvariant()
+        $rlevel = if ($nStr -in @('false', 'allow')) { 'REVIEW' } else { 'INFO' }
+        $State.SecuritySettings.Add([pscustomobject]@{
+            scope = $Scope
+            key = 'sandbox.network'
+            value = $nStr
+            risk_level = $rlevel
+        })
+        if ($nStr -in @('false', 'allow')) {
+            Add-Finding $State 'REVIEW' 'Security Settings' 'Terminal sandbox network isolation is disabled/allowed' "scope=$Scope"
+        }
+    }
+
+    # 3. Non-workspace file access
+    $fileAccess = Get-Property $json 'nonWorkspaceFileAccess'
+    if (-not $fileAccess) { $fileAccess = Get-Property $json 'fileAccessPolicy' }
+    if ($fileAccess) {
+        $faStr = [string]$fileAccess
+        $rlevel = if ($faStr -eq 'allow') { 'WARN' } else { 'INFO' }
+        $State.SecuritySettings.Add([pscustomobject]@{
+            scope = $Scope
+            key = 'nonWorkspaceFileAccess'
+            value = $faStr
+            risk_level = $rlevel
+        })
+        if ($faStr -eq 'allow') {
+            Add-Finding $State 'WARN' 'Security Settings' "Non-workspace file access policy set to 'allow'" "scope=$Scope"
+        }
+    }
+
+    # 4. Internet access policy
+    $netAccess = Get-Property $json 'internetAccessPolicy'
+    if (-not $netAccess) { $netAccess = Get-Property $json 'networkAccess' }
+    if ($netAccess) {
+        $naStr = [string]$netAccess
+        $rlevel = if ($naStr -eq 'allow') { 'REVIEW' } else { 'INFO' }
+        $State.SecuritySettings.Add([pscustomobject]@{
+            scope = $Scope
+            key = 'internetAccessPolicy'
+            value = $naStr
+            risk_level = $rlevel
+        })
+        if ($naStr -eq 'allow') {
+            Add-Finding $State 'REVIEW' 'Security Settings' "Internet access policy set to unrestricted 'allow'" "scope=$Scope"
+        }
+    }
+
+    # 5. Browser domain policy / allowlist
+    $bAllow = Get-Property $json 'browserAllowlist'
+    if (-not $bAllow) { $bAllow = Get-Property $json 'browserDomainPolicy' }
+    if ($bAllow) {
+        $baStr = @($bAllow) -join ','
+        $rlevel = if ($baStr -eq '*') { 'REVIEW' } else { 'INFO' }
+        $State.SecuritySettings.Add([pscustomobject]@{
+            scope = $Scope
+            key = 'browserAllowlist'
+            value = $baStr
+            risk_level = $rlevel
+        })
+        if ($baStr -eq '*') {
+            Add-Finding $State 'REVIEW' 'Security Settings' 'Browser navigation allows all domains (*)' "scope=$Scope"
+        }
+    }
+
+    # 6. Command allowlist
+    $cmdAllow = Get-Property $json 'commandAllowlist'
+    if ($cmdAllow) {
+        $caStr = @($cmdAllow) -join ','
+        $State.SecuritySettings.Add([pscustomobject]@{
+            scope = $Scope
+            key = 'commandAllowlist'
+            value = $caStr
+            risk_level = 'INFO'
+        })
+        foreach ($hint in $script:DangerousMcpHints) {
+            if ($caStr -match "(?i)\b$hint\b") {
+                Add-Finding $State 'WARN' 'Security Settings' "Command allowlist contains risky tool: $hint" "scope=$Scope; allowlist=$caStr"
+                break
+            }
+        }
+    }
+
+    # 7. Artifact review mode
+    $artReview = Get-Property $json 'artifactReviewMode'
+    if ($artReview) {
+        $arStr = [string]$artReview
+        $rlevel = if ($arStr -eq 'always-proceed') { 'REVIEW' } else { 'INFO' }
+        $State.SecuritySettings.Add([pscustomobject]@{
+            scope = $Scope
+            key = 'artifactReviewMode'
+            value = $arStr
+            risk_level = $rlevel
+        })
+        if ($arStr -eq 'always-proceed') {
+            Add-Finding $State 'REVIEW' 'Security Settings' "Artifact review mode is set to 'always-proceed'" "scope=$Scope"
+        }
+    }
+}
+
 function Collect-Customizations($State, [string]$ConfigDir, [string]$Source) {
     $skillsDir = Join-Path $ConfigDir 'skills'
     if (Test-Path -LiteralPath $skillsDir -PathType Container) {
@@ -272,21 +667,29 @@ function Collect-Customizations($State, [string]$ConfigDir, [string]$Source) {
             }
         } catch {}
     }
-    $agentsMd = Join-Path $ConfigDir 'AGENTS.md'
-    if (Test-Path -LiteralPath $agentsMd -PathType Leaf) {
-        Add-Finding $State 'INFO' 'Skills' "Custom system rules defined in AGENTS.md" "source=$Source; path=$agentsMd"
+    foreach ($rname in @('AGENTS.md', 'GEMINI.md')) {
+        $agentsMd = Join-Path $ConfigDir $rname
+        if (Test-Path -LiteralPath $agentsMd -PathType Leaf) {
+            Add-Finding $State 'INFO' 'Rules' "Rule file defined in $rname" "source=$Source; path=$agentsMd"
+        }
+    }
+    $rulesDir = Join-Path $ConfigDir 'rules'
+    if (Test-Path -LiteralPath $rulesDir -PathType Container) {
+        $rfiles = @(Get-ChildItem -LiteralPath $rulesDir -Filter '*.md' -File -ErrorAction SilentlyContinue)
+        foreach ($rf in $rfiles) {
+            Add-Finding $State 'INFO' 'Rules' "Rule file defined in $($rf.Name)" "source=$Source; path=$($rf.FullName)"
+        }
     }
 }
 
 function Collect-MainConfig($State) {
     $settingsPath = Join-Path $State.AntigravityDir 'settings.json'
     if (Test-Path -LiteralPath $settingsPath -PathType Leaf) {
-        Add-SensitiveFile $State 'settings.json' $settingsPath 'REVIEW'
+        Collect-SecuritySettings $State $settingsPath 'global'
         $json = Read-JsonFile $settingsPath
-        if ($null -eq $json) {
-            Add-Finding $State 'REVIEW' 'Config' 'Unable to parse settings.json' $settingsPath
-        } else {
+        if ($json) {
             $model = Get-Property (Get-Property $json 'model') 'name'
+            if (-not $model) { $model = Get-Property $json 'model' }
             if ($model) { Add-Finding $State 'INFO' 'Config' "Default model: $model" }
             $theme = Get-Property $json 'theme'
             if ($theme) { Add-Finding $State 'INFO' 'Config' "Theme: $theme" }
@@ -299,6 +702,23 @@ function Collect-MainConfig($State) {
         }
     } else {
         Add-Finding $State 'INFO' 'Config' 'settings.json not found' $settingsPath
+    }
+
+    # App settings
+    $appSettings = Join-Path (Join-Path $State.AntigravityDir 'antigravity') 'settings.json'
+    if (Test-Path -LiteralPath $appSettings -PathType Leaf) {
+        Collect-SecuritySettings $State $appSettings 'app'
+    }
+
+    # CLI settings
+    $cliSettings = Join-Path (Join-Path $State.AntigravityDir 'antigravity-cli') 'settings.json'
+    if (Test-Path -LiteralPath $cliSettings -PathType Leaf) {
+        Collect-SecuritySettings $State $cliSettings 'cli'
+        $cliJson = Read-JsonFile $cliSettings
+        if ($cliJson) {
+            $cmodel = Get-Property $cliJson 'model'
+            if ($cmodel) { Add-Finding $State 'INFO' 'Config' "CLI model: $cmodel" }
+        }
     }
 }
 
@@ -318,9 +738,21 @@ function Collect-Projects($State) {
             $hasAgents = $false
             if (Test-Path -LiteralPath $path -PathType Container) {
                 $agentsDir = Join-Path $path '.agents'
+                if (-not (Test-Path -LiteralPath $agentsDir -PathType Container)) {
+                    $agentsDir = Join-Path $path '.agent'
+                }
                 if (Test-Path -LiteralPath $agentsDir -PathType Container) {
                     $hasAgents = $true
                     Collect-Customizations $State $agentsDir "workspace:$name"
+                    Collect-McpFile $State (Join-Path $agentsDir 'mcp_config.json') "workspace:$name"
+                    Collect-HooksFile $State (Join-Path $agentsDir 'hooks.json') "workspace:$name"
+                    Collect-Plugins $State (Join-Path $agentsDir 'plugins') "workspace:$name" (Join-Path $agentsDir 'config.json')
+                    Collect-JsonConfigs $State $agentsDir "workspace:$name"
+                }
+                foreach ($pset in @((Join-Path (Join-Path $path '.gemini') 'settings.json'), (Join-Path (Join-Path $path '.agents') 'settings.json'))) {
+                    if (Test-Path -LiteralPath $pset -PathType Leaf) {
+                        Collect-SecuritySettings $State $pset "project:$name"
+                    }
                 }
             }
             $State.Projects.Add([pscustomobject]@{
@@ -422,10 +854,13 @@ function Collect-Retention($State) {
     if (Test-Path -LiteralPath $antigravitySub -PathType Container) {
         Add-RetentionDirectory $State 'antigravity-brain' (Join-Path $antigravitySub 'brain') 500MB
     }
+    $cliSub = Join-Path $State.AntigravityDir 'antigravity-cli'
+    if (Test-Path -LiteralPath $cliSub -PathType Container) {
+        Add-RetentionDirectory $State 'antigravity-cli' $cliSub 200MB
+    }
 }
 
 function Collect-Runtime($State) {
-    # Check for running processes that could be antigravity / gemini related
     $procs = @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
         $_.ProcessName -match '(?i)(antigravity|gemini)'
     })
@@ -453,8 +888,9 @@ function Convert-StateForOutput($State, [switch]$SummaryOnly) {
             }
         })
         foreach ($pair in @(
-            @('trusted_folders', 'TrustedFolders'), @('projects', 'Projects'),
-            @('skills', 'Skills'), @('sensitive_files', 'SensitiveFiles'),
+            @('mcp_servers', 'McpServers'), @('hooks', 'Hooks'), @('plugins', 'Plugins'),
+            @('security_settings', 'SecuritySettings'), @('trusted_folders', 'TrustedFolders'),
+            @('projects', 'Projects'), @('skills', 'Skills'), @('sensitive_files', 'SensitiveFiles'),
             @('retention', 'Retention')
         )) {
             $base[$pair[0]] = @($State[$pair[1]] | ForEach-Object {
@@ -467,6 +903,54 @@ function Convert-StateForOutput($State, [switch]$SummaryOnly) {
         }
     }
     [pscustomobject]$base
+}
+
+function Compare-Snapshots($CurrentObj, [string]$BaselinePath) {
+    if (-not (Test-Path -LiteralPath $BaselinePath -PathType Leaf)) {
+        [Console]::Error.WriteLine("Error: cannot read baseline: $BaselinePath")
+        exit 1
+    }
+    $baseObj = Read-JsonFile $BaselinePath
+    if ($null -eq $baseObj) {
+        [Console]::Error.WriteLine("Error: unable to parse baseline JSON: $BaselinePath")
+        exit 1
+    }
+
+    $diffResult = [ordered]@{
+        changed = [Collections.Generic.List[object]]::new()
+        has_changes = $false
+    }
+
+    $sections = @(
+        @{ Name = 'mcp_servers'; Key = 'name' },
+        @{ Name = 'hooks'; Key = 'name' },
+        @{ Name = 'plugins'; Key = 'id' },
+        @{ Name = 'security_settings'; Key = 'key' },
+        @{ Name = 'trusted_folders'; Key = 'path' },
+        @{ Name = 'projects'; Key = 'path' },
+        @{ Name = 'skills'; Key = 'name' }
+    )
+
+    foreach ($sec in $sections) {
+        $sName = $sec.Name
+        $sKey = $sec.Key
+        $oldItems = @(Get-Property $baseObj $sName | ForEach-Object { [string](Get-Property $_ $sKey) } | Where-Object { $_ } | Select-Object -Unique)
+        $newItems = @(Get-Property $CurrentObj $sName | ForEach-Object { [string](Get-Property $_ $sKey) } | Where-Object { $_ } | Select-Object -Unique)
+
+        $added = @($newItems | Where-Object { $_ -notin $oldItems } | Sort-Object)
+        $removed = @($oldItems | Where-Object { $_ -notin $newItems } | Sort-Object)
+
+        if ($added.Count -gt 0 -or $removed.Count -gt 0) {
+            $diffResult.changed.Add([ordered]@{
+                section = $sName
+                added = $added
+                removed = $removed
+            })
+        }
+    }
+
+    $diffResult.has_changes = $diffResult.changed.Count -gt 0
+    $diffResult
 }
 
 function Write-TerminalReport($State) {
@@ -497,8 +981,14 @@ function Write-TerminalReport($State) {
         Write-Output ''
     }
     foreach ($section in @(
-        @('Trusted Folders', 'TrustedFolders', 'path'), @('Projects', 'Projects', 'path'),
-        @('Skills', 'Skills', 'name'), @('Sensitive Files', 'SensitiveFiles', 'name'),
+        @('MCP Servers', 'McpServers', 'name'),
+        @('Lifecycle Hooks', 'Hooks', 'name'),
+        @('Plugins', 'Plugins', 'name'),
+        @('Security Settings', 'SecuritySettings', 'key'),
+        @('Trusted Folders', 'TrustedFolders', 'path'),
+        @('Projects', 'Projects', 'path'),
+        @('Skills', 'Skills', 'name'),
+        @('Sensitive Files', 'SensitiveFiles', 'name'),
         @('Retention', 'Retention', 'name')
     )) {
         Write-Output $section[0]
@@ -524,7 +1014,7 @@ function ConvertTo-HtmlEncoded([AllowNull()][object]$Value) {
 function New-HtmlReport($States) {
     $builder = [Text.StringBuilder]::new()
     [void]$builder.AppendLine('<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ANTIGRAVITY-AUDIT Report</title>')
-    [void]$builder.AppendLine('<style>body{margin:0;background:#0d1117;color:#e6edf3;font-family:"Segoe UI",sans-serif}main{max-width:1180px;margin:auto;padding:32px 20px}h2{margin-top:28px}.meta{color:#8b949e}.summary{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:20px 0}.summary div{background:#161b22;border:1px solid #30363d;padding:12px}.summary span{display:block;color:#8b949e}.summary strong{font-size:24px}table{width:100%;border-collapse:collapse;border:1px solid #30363d}th,td{padding:9px 10px;border-bottom:1px solid #30363d;text-align:left;vertical-align:top;font-size:13px}th{color:#8b949e;background:#161b22}code{color:#cae8ff;white-space:pre-wrap;word-break:break-word}.badge{padding:2px 6px;font-weight:700}.WARN{background:#5c1f1f;color:#ffa198}.REVIEW{background:#3d2f00;color:#f0c846}.INFO{background:#0c2a4a;color:#79c0ff}</style></head><body><main>')
+    [void]$builder.AppendLine('<style>body{margin:0;background:#0d1117;color:#e6edf3;font-family:"Segoe UI",sans-serif}main{max-width:1180px;margin:auto;padding:32px 20px}h2{margin-top:28px}.meta{color:#8b949e}.summary{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:20px 0}.summary div{background:#161b22;border:1px solid #30363d;padding:12px}.summary span{display:block;color:#8b949e}.summary strong{font-size:24px}table{width:100%;border-collapse:collapse;border:1px solid #30363d;margin-bottom:20px}th,td{padding:9px 10px;border-bottom:1px solid #30363d;text-align:left;vertical-align:top;font-size:13px}th{color:#8b949e;background:#161b22}code{color:#cae8ff;white-space:pre-wrap;word-break:break-word}.badge{padding:2px 6px;font-weight:700}.WARN{background:#5c1f1f;color:#ffa198}.REVIEW{background:#3d2f00;color:#f0c846}.INFO{background:#0c2a4a;color:#79c0ff}</style></head><body><main>')
     foreach ($state in $States) {
         $summary = Get-Summary $state
         [void]$builder.AppendLine("<section><h1>ANTIGRAVITY-AUDIT</h1><p class=`"meta`">User: <strong>$(ConvertTo-HtmlEncoded (Get-DisplayText $state $state.User))</strong> &middot; Host: <strong>$(ConvertTo-HtmlEncoded $state.Hostname)</strong> &middot; Generated: <strong>$(ConvertTo-HtmlEncoded $state.Timestamp)</strong></p>")
@@ -534,7 +1024,41 @@ function New-HtmlReport($States) {
             if ($script:Options.Quiet -and $finding.severity -eq 'INFO') { continue }
             [void]$builder.AppendLine("<tr><td><span class=`"badge $($finding.severity)`">$($finding.severity)</span></td><td>$(ConvertTo-HtmlEncoded $finding.section)</td><td>$(ConvertTo-HtmlEncoded (Get-DisplayText $state $finding.message))</td><td><code>$(ConvertTo-HtmlEncoded (Get-DisplayText $state $finding.detail))</code></td></tr>")
         }
-        [void]$builder.AppendLine('</tbody></table></section>')
+        [void]$builder.AppendLine('</tbody></table>')
+
+        if ($state.McpServers.Count -gt 0) {
+            [void]$builder.AppendLine('<h2>MCP Servers</h2><table><thead><tr><th>Name</th><th>Type</th><th>Command / URL</th><th>Env Keys</th><th>Source</th></tr></thead><tbody>')
+            foreach ($m in $state.McpServers) {
+                [void]$builder.AppendLine("<tr><td>$(ConvertTo-HtmlEncoded (Get-DisplayText $state $m.name))</td><td>$(ConvertTo-HtmlEncoded $m.type)</td><td><code>$(ConvertTo-HtmlEncoded (Get-DisplayText $state $m.command_or_url))</code></td><td>$(ConvertTo-HtmlEncoded $m.env_keys)</td><td>$(ConvertTo-HtmlEncoded $m.source)</td></tr>")
+            }
+            [void]$builder.AppendLine('</tbody></table>')
+        }
+
+        if ($state.Hooks.Count -gt 0) {
+            [void]$builder.AppendLine('<h2>Lifecycle Hooks</h2><table><thead><tr><th>Name</th><th>Event</th><th>Matcher</th><th>Command</th><th>Enabled</th><th>Source</th></tr></thead><tbody>')
+            foreach ($h in $state.Hooks) {
+                [void]$builder.AppendLine("<tr><td>$(ConvertTo-HtmlEncoded (Get-DisplayText $state $h.name))</td><td>$(ConvertTo-HtmlEncoded $h.event)</td><td>$(ConvertTo-HtmlEncoded $h.matcher)</td><td><code>$(ConvertTo-HtmlEncoded (Get-DisplayText $state $h.command))</code></td><td>$(ConvertTo-HtmlEncoded $h.enabled)</td><td>$(ConvertTo-HtmlEncoded $h.source)</td></tr>")
+            }
+            [void]$builder.AppendLine('</tbody></table>')
+        }
+
+        if ($state.Plugins.Count -gt 0) {
+            [void]$builder.AppendLine('<h2>Plugins</h2><table><thead><tr><th>ID</th><th>Name</th><th>Enabled</th><th>Features</th><th>Source</th></tr></thead><tbody>')
+            foreach ($p in $state.Plugins) {
+                [void]$builder.AppendLine("<tr><td><code>$(ConvertTo-HtmlEncoded (Get-DisplayText $state $p.id))</code></td><td>$(ConvertTo-HtmlEncoded (Get-DisplayText $state $p.name))</td><td>$(ConvertTo-HtmlEncoded $p.enabled)</td><td><code>$(ConvertTo-HtmlEncoded $p.features)</code></td><td>$(ConvertTo-HtmlEncoded $p.source)</td></tr>")
+            }
+            [void]$builder.AppendLine('</tbody></table>')
+        }
+
+        if ($state.SecuritySettings.Count -gt 0) {
+            [void]$builder.AppendLine('<h2>Security Settings</h2><table><thead><tr><th>Scope</th><th>Setting</th><th>Value</th><th>Risk</th></tr></thead><tbody>')
+            foreach ($s in $state.SecuritySettings) {
+                [void]$builder.AppendLine("<tr><td>$(ConvertTo-HtmlEncoded $s.scope)</td><td><code>$(ConvertTo-HtmlEncoded $s.key)</code></td><td><code>$(ConvertTo-HtmlEncoded (Get-DisplayText $state $s.value))</code></td><td><span class=`"badge $($s.risk_level)`">$($s.risk_level)</span></td></tr>")
+            }
+            [void]$builder.AppendLine('</tbody></table>')
+        }
+
+        [void]$builder.AppendLine('</section>')
     }
     [void]$builder.AppendLine('</main></body></html>')
     $builder.ToString()
@@ -582,6 +1106,10 @@ function Invoke-Audit([string]$UserName, [string]$HomeDir) {
     $globalConfig = Join-Path $antigravityDir 'config'
     if (Test-Path -LiteralPath $globalConfig -PathType Container) {
         Collect-Customizations $state $globalConfig 'global'
+        Collect-McpFile $state (Join-Path $globalConfig 'mcp_config.json') 'global'
+        Collect-HooksFile $state (Join-Path $globalConfig 'hooks.json') 'global'
+        Collect-Plugins $state (Join-Path $globalConfig 'plugins') 'global' (Join-Path $globalConfig 'config.json')
+        Collect-JsonConfigs $state $globalConfig 'global'
     }
 
     # Sensitive files collection
@@ -602,6 +1130,32 @@ if ($targets.Count -eq 0) {
 }
 
 $states = @($targets | ForEach-Object { Invoke-Audit $_.User $_.Home })
+
+if ($script:Options.Diff) {
+    $currentObj = Convert-StateForOutput $states[0]
+    $diffObj = Compare-Snapshots $currentObj $script:Options.Diff
+    if ($script:Options.DiffJson) {
+        $diffObj | ConvertTo-Json -Depth 10
+    } else {
+        if (-not $diffObj.has_changes) {
+            Write-Output 'No baseline differences detected.'
+        } else {
+            foreach ($sec in $diffObj.changed) {
+                Write-Output "## $($sec.section)"
+                if ($sec.added.Count -gt 0) {
+                    Write-Output 'Added:'
+                    foreach ($a in $sec.added) { Write-Output "  + $a" }
+                }
+                if ($sec.removed.Count -gt 0) {
+                    Write-Output 'Removed:'
+                    foreach ($r in $sec.removed) { Write-Output "  - $r" }
+                }
+            }
+        }
+    }
+    exit 0
+}
+
 $content = if ($script:Options.Json) {
     $objects = @($states | ForEach-Object { Convert-StateForOutput $_ -SummaryOnly:$script:Options.Summary })
     $jsonObject = if ($objects.Count -eq 1) { $objects[0] } else { $objects }
